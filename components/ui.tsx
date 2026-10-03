@@ -7,7 +7,7 @@ export function Money({ amount, currency }: { amount: number | null; currency: s
 
 /** Amounts in several currencies are listed, never added together. */
 export function Totals({ rows }: { rows: { currency: string; total: number }[] }) {
-  if (!rows.length) return <>{formatMoney(0, "EUR")}</>;
+  if (!rows.length) return <>—</>;
   return <>{rows.map((r) => formatMoney(r.total, r.currency)).join(" · ")}</>;
 }
 

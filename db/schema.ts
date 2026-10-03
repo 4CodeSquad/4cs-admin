@@ -12,6 +12,7 @@ import {
   index,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
 
 /*
  * Column names are snake_case in Postgres (casing: "snake_case" in the client
@@ -266,6 +267,9 @@ export const payments = pgTable(
     method: text(),
     reference: text(),
     recurringPlanId: text().references(() => recurringPlans.id, { onDelete: "set null" }),
+    /** Set on member payouts created automatically from a client payment's
+        split (lib/money-flow.ts). Such payouts are managed through that payment. */
+    sourcePaymentId: text().references((): AnyPgColumn => payments.id, { onDelete: "set null" }),
     createdById: text().references(() => user.id, { onDelete: "set null" }),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -276,6 +280,64 @@ export const payments = pgTable(
     index().on(t.status, t.dueDate),
     // The daily job can run twice without double-billing.
     uniqueIndex().on(t.recurringPlanId, t.dueDate),
+    index().on(t.sourcePaymentId),
+  ],
+);
+
+export const shareKind = pgEnum("share_kind", ["percent", "fixed"]);
+
+/**
+ * How a project's income is split. Each member has either a percentage of
+ * every client payment, or a fixed total for the project (paid out pro rata to
+ * the budget as the client pays). The company keeps whatever is left.
+ */
+export const projectShares = pgTable(
+  "project_shares",
+  {
+    projectId: text()
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    userId: text()
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    kind: shareKind().notNull(),
+    /** percent shares: hundredths of a percent (4000 = 40.00%). */
+    basisPoints: integer(),
+    /** fixed shares: total for the project, minor units, project currency. */
+    amount: bigint({ mode: "number" }),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [primaryKey({ columns: [t.projectId, t.userId] })],
+);
+
+export const fundDirection = pgEnum("fund_direction", ["in", "out"]);
+
+/**
+ * The company fund: every movement of the company's own money. Entries with a
+ * paymentId are written automatically when a payment is marked paid (the
+ * company's share of client income, or a project cost the company paid);
+ * the rest are added by hand with a description.
+ */
+export const fundEntries = pgTable(
+  "fund_entries",
+  {
+    id: id(),
+    entryDate: date().notNull(),
+    direction: fundDirection().notNull(),
+    amount: bigint({ mode: "number" }).notNull(),
+    currency: currency().notNull(),
+    category: text().notNull(),
+    description: text().notNull(),
+    projectId: text().references(() => projects.id, { onDelete: "set null" }),
+    paymentId: text().references(() => payments.id, { onDelete: "cascade" }),
+    createdById: text().references(() => user.id, { onDelete: "set null" }),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index().on(t.entryDate),
+    // At most one fund movement per payment.
+    uniqueIndex().on(t.paymentId),
   ],
 );
 

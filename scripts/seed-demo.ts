@@ -12,6 +12,7 @@ import { createAuth } from "../lib/auth-config";
 import * as s from "../db/schema";
 import { today, addDays } from "../lib/dates";
 import { generateRecurringPayments } from "../lib/recurring";
+import { markPaymentPaid } from "../lib/money-flow";
 
 const url = requireEnv("DATABASE_URL");
 if (!/@(localhost|127\.0\.0\.1)[:/]/.test(url)) {
@@ -47,14 +48,26 @@ await db.insert(s.projectMembers).values([
   { projectId: web.id, userId: designer, role: "Design" },
   { projectId: app.id, userId: designer, role: "Design" },
 ]);
-await db.insert(s.payments).values([
-  { projectId: web.id, direction: "incoming", description: "Deposit 30%", amount: 360000, currency: "EUR", dueDate: addDays(t, -55), status: "paid", paidOn: addDays(t, -50), method: "Bank transfer", createdById: admin },
+// Split on the e-commerce project: Dea a fixed €3,000, Dritan 15%, the company the rest.
+await db.insert(s.projectShares).values([
+  { projectId: web.id, userId: dev, kind: "fixed", amount: 300000 },
+  { projectId: web.id, userId: designer, kind: "percent", basisPoints: 1500 },
+]);
+const [deposit, , , , uiDesign] = await db.insert(s.payments).values([
+  { projectId: web.id, direction: "incoming", description: "Deposit 30%", amount: 360000, currency: "EUR", dueDate: addDays(t, -55), method: "Bank transfer", createdById: admin },
   { projectId: web.id, direction: "incoming", description: "Milestone 2", amount: 480000, currency: "EUR", dueDate: addDays(t, -5), createdById: admin },
   { projectId: web.id, direction: "incoming", description: "Final 30%", amount: 360000, currency: "EUR", dueDate: addDays(t, 45), createdById: admin },
   { projectId: web.id, direction: "outgoing", userId: dev, description: "Development — sprint 1–4", amount: 250000, currency: "EUR", dueDate: addDays(t, 3), createdById: admin },
-  { projectId: web.id, direction: "outgoing", userId: designer, description: "UI design", amount: 90000, currency: "EUR", dueDate: addDays(t, -30), status: "paid", paidOn: addDays(t, -28), createdById: admin },
+  { projectId: web.id, direction: "outgoing", counterparty: "Figma", description: "Design tool licence", amount: 4500, currency: "EUR", dueDate: addDays(t, -30), createdById: admin },
   { projectId: app.id, direction: "incoming", description: "Deposit", amount: 25500000, currency: "ALL", dueDate: addDays(t, 10), createdById: admin },
   { projectId: app.id, direction: "outgoing", counterparty: "Apple Developer Program", description: "Developer account", amount: 9900, currency: "USD", dueDate: addDays(t, 2), createdById: admin },
+]).returning();
+// "Paid" goes through the real flow, so shares and the company fund are filled in.
+await markPaymentPaid(db, deposit.id, addDays(t, -50), admin);
+await markPaymentPaid(db, uiDesign.id, addDays(t, -28), admin);
+await db.insert(s.fundEntries).values([
+  { entryDate: addDays(t, -40), direction: "in", amount: 200000, currency: "EUR", category: "Owner investment", description: "Starting capital", createdById: admin },
+  { entryDate: addDays(t, -10), direction: "out", amount: 129900, currency: "EUR", category: "Equipment", description: "MacBook Air for the design team", createdById: admin },
 ]);
 await db.insert(s.recurringPlans).values({
   projectId: web.id, direction: "incoming", description: "Hosting & maintenance", amount: 15000, currency: "EUR",

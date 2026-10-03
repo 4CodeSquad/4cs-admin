@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { db, reset } from "./db";
 import { seed, admin, memberA, memberB, clientC, stranger } from "./fixtures";
+import * as s from "../db/schema";
 import { dashboard, getProject, listPayments, listProjects } from "@/lib/queries";
 
 const T = "2026-02-01";
@@ -63,5 +64,28 @@ describe("notes and links", () => {
     const p = (await getProject(db, clientC, "P1", T))!;
     expect(ids(p.notes)).toEqual(["n-client"]);
     expect(ids(p.links)).toEqual(["l-client"]);
+  });
+});
+
+describe("money split", () => {
+  beforeAll(async () => {
+    // Shares for memberA and for memberB (who isn't on P1): A must not see B's.
+    await db.insert(s.projectShares).values([
+      { projectId: "P1", userId: "memberA", kind: "percent", basisPoints: 4000 },
+      { projectId: "P1", userId: "memberB", kind: "fixed", amount: 100000 },
+    ]);
+  });
+  it("admin sees every share and the money summary", async () => {
+    const p = (await getProject(db, admin, "P1", T))!;
+    expect(p.shares.map((x) => x.userId)).toEqual(["memberA", "memberB"]);
+    expect(p.money).not.toBeNull();
+  });
+  it("a member sees only their own share, and no money summary", async () => {
+    const p = (await getProject(db, memberA, "P1", T))!;
+    expect(p.shares).toEqual([expect.objectContaining({ userId: "memberA", basisPoints: 4000 })]);
+    expect(p.money).toBeNull();
+  });
+  it("a client sees no shares", async () => {
+    expect((await getProject(db, clientC, "P1", T))!.shares).toEqual([]);
   });
 });

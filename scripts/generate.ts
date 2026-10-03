@@ -8,7 +8,7 @@
  */
 import { cpSync, mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { execFileSync } from "node:child_process";
 
 const repoDir = join(process.cwd(), "db/migrations");
@@ -26,7 +26,8 @@ try {
   if (existsSync(repoDir)) cpSync(repoDir, tmp, { recursive: true });
   execFileSync("npx", ["drizzle-kit", "generate", ...process.argv.slice(2)], {
     stdio: "inherit",
-    env: { ...process.env, DRIZZLE_OUT: tmp },
+    // drizzle-kit prefixes "./" to the out dir, so it must be relative.
+    env: { ...process.env, DRIZZLE_OUT: relative(process.cwd(), tmp) },
   });
   cpSync(tmp, repoDir, { recursive: true });
   clean(repoDir);

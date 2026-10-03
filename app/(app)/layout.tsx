@@ -8,6 +8,7 @@ const LINKS = {
     { href: "/", label: "Dashboard" },
     { href: "/projects", label: "Projects" },
     { href: "/payments", label: "Payments" },
+    { href: "/fund", label: "Company fund" },
     { href: "/clients", label: "Clients" },
     { href: "/team", label: "Team & access" },
     { href: "/account", label: "Account" },

@@ -2,7 +2,10 @@
 
 import { useTransition } from "react";
 
-/** A button that runs a bound server action, asking first when `confirm` is set. */
+/**
+ * A button that runs a bound server action, asking first when `confirm` is set.
+ * If the action returns `{ error }` (e.g. a refused undo), it's shown to the user.
+ */
 export default function ConfirmButton({
   action,
   children,
@@ -23,7 +26,8 @@ export default function ConfirmButton({
       onClick={() => {
         if (confirm && !window.confirm(confirm)) return;
         start(async () => {
-          await action();
+          const result = (await action()) as { error?: string } | undefined;
+          if (result?.error) window.alert(result.error);
         });
       }}
     >

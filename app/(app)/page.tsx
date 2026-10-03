@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { db } from "@/db";
 import { requireUser } from "@/lib/dal";
-import { dashboard } from "@/lib/queries";
+import { dashboard, fundBalance } from "@/lib/queries";
 import { today } from "@/lib/dates";
 import { D, Direction, Money, PaymentStatus, Totals } from "@/components/ui";
 
@@ -10,7 +10,7 @@ export const metadata: Metadata = { title: "Dashboard" };
 export default async function Dashboard() {
   const me = await requireUser();
   const t = today();
-  const d = await dashboard(db, me, t);
+  const [d, fund] = await Promise.all([dashboard(db, me, t), me.role === "admin" ? fundBalance(db) : Promise.resolve([])]);
   const overdue = (rows: { currency: string; overdue: number }[]) =>
     rows.filter((r) => r.overdue > 0).map((r) => ({ currency: r.currency, total: r.overdue }));
 
@@ -45,6 +45,12 @@ export default async function Dashboard() {
             <p className="eyebrow">{me.role === "member" ? "Owed to you" : "4CS owes"}</p>
             <p className="value"><Totals rows={d.outgoing} /></p>
           </div>
+        )}
+        {me.role === "admin" && (
+          <a className="card stat" href="/fund" style={{ textDecoration: "none" }}>
+            <p className="eyebrow">Company fund</p>
+            <p className="value"><Totals rows={fund} /></p>
+          </a>
         )}
         <div className="card stat">
           <p className="eyebrow">{me.role === "admin" ? "Settled this year" : "Paid this year"}</p>

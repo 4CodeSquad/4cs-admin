@@ -8,6 +8,13 @@
       "when": 1791019928352,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1791025916874,
+      "tag": "0001_company_fund_and_splits",
+      "breakpoints": true
     }
   ]
 }

@@ -7,7 +7,9 @@ import { today, formatDate } from "@/lib/dates";
 import { CURRENCIES } from "@/lib/money";
 import ActionForm from "@/components/ActionForm";
 import ConfirmButton from "@/components/ConfirmButton";
-import { D, Direction, Money, PaymentStatus, ProjectStatus } from "@/components/ui";
+import { D, Direction, Money, PaymentStatus, ProjectStatus, Totals } from "@/components/ui";
+import { effectiveBasisPoints, BP } from "@/lib/money-flow";
+import { formatMoney } from "@/lib/money";
 import {
   addLink,
   addMember,
@@ -20,7 +22,9 @@ import {
   markPaid,
   markPending,
   removeMember,
+  removeShare,
   savePayment,
+  setShare,
   setPlanActive,
 } from "@/app/actions/data";
 
@@ -35,6 +39,14 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[id]"
   if (!p) notFound();
   const isAdmin = me.role === "admin";
   const people = isAdmin ? (await listUsers(db)).filter((u) => u.role !== "client" && !u.banned) : [];
+
+  // Split summary: each share as a % of every client payment; the company keeps the rest.
+  const pctOf = (bp: number) => `${(bp / 100).toFixed(2).replace(/\.00$/, "")}%`;
+  const shareLabel = (s: (typeof p.shares)[number]) =>
+    s.kind === "percent"
+      ? `${pctOf(s.basisPoints ?? 0)} of each client payment`
+      : `${formatMoney(s.amount ?? 0, p.currency)} fixed for the project`;
+  const splitBp = p.shares.reduce((t, s) => t + effectiveBasisPoints(s, p.budget), 0);
 
   return (
     <div className="stack">
@@ -103,6 +115,93 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[id]"
         </div>
       </div>
 
+      {me.role !== "client" && (
+        <div className="grid two">
+          <div className="card">
+            <h2>Money split</h2>
+            {me.role === "member" ? (
+              p.shares.length ? (
+                <p>
+                  Your share: <strong>{shareLabel(p.shares[0])}</strong>.
+                  {p.shares[0].kind === "fixed" && " It's paid out step by step as the client pays."} Each time the client pays,
+                  your part appears under your payments.
+                </p>
+              ) : (
+                <p className="empty">No share set for you on this project.</p>
+              )
+            ) : (
+              <>
+                {p.shares.length === 0 ? (
+                  <p className="empty">No split yet — everything the client pays goes to the company fund.</p>
+                ) : (
+                  <table>
+                    <tbody>
+                      {p.shares.map((s) => (
+                        <tr key={s.userId}>
+                          <td>{s.name}</td>
+                          <td>{shareLabel(s)}</td>
+                          <td className="num muted">{pctOf(effectiveBasisPoints(s, p.budget))}</td>
+                          <td className="num">
+                            <ConfirmButton action={removeShare.bind(null, p.id, s.userId)} className="btn small danger" confirm={`Remove ${s.name}'s share? Payouts already created stay.`}>
+                              Remove
+                            </ConfirmButton>
+                          </td>
+                        </tr>
+                      ))}
+                      <tr>
+                        <td><strong>Company fund</strong></td>
+                        <td className="muted">the rest of each payment</td>
+                        <td className="num"><strong>{pctOf(Math.max(0, BP - splitBp))}</strong></td>
+                        <td></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                )}
+                <details className="add" style={{ marginTop: 12 }}>
+                  <summary className="btn small secondary">Set a share</summary>
+                  <ActionForm action={setShare} submit="Save share" resetOnSuccess>
+                    <input type="hidden" name="projectId" value={p.id} />
+                    <div className="cols">
+                      <label>Person
+                        <select name="userId" required defaultValue="">
+                          <option value="" disabled>Choose…</option>
+                          {(p.members.length ? p.members.map((m) => ({ id: m.userId, name: m.name })) : people).map((u) => (
+                            <option key={u.id} value={u.id}>{u.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>Type
+                        <select name="kind" defaultValue="percent">
+                          <option value="percent">% of each client payment</option>
+                          <option value="fixed">Fixed amount for the project ({p.currency})</option>
+                        </select>
+                      </label>
+                      <label>Value<input name="value" required inputMode="decimal" placeholder="40  or  3000" /></label>
+                    </div>
+                    <p className="muted">
+                      Fixed amounts are paid out in proportion to the budget as the client pays, and stop at the amount.
+                      Changes apply to client payments marked paid from now on.
+                    </p>
+                  </ActionForm>
+                </details>
+              </>
+            )}
+          </div>
+          {p.money && (
+            <div className="card">
+              <h2>Where the money went</h2>
+              <dl className="facts">
+                <dt>Client paid</dt><dd><Totals rows={p.money.received} /></dd>
+                <dt>Team — paid</dt><dd><Totals rows={p.money.teamPaid} /></dd>
+                <dt>Team — still to pay</dt><dd><Totals rows={p.money.teamPending} /></dd>
+                <dt>Into company fund</dt><dd><Totals rows={p.money.companyShare} /></dd>
+                <dt>Project costs (from fund)</dt><dd><Totals rows={p.money.costs} /></dd>
+              </dl>
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="card">
         <div className="spread">
           <h2>{me.role === "member" ? "Your payments on this project" : me.role === "client" ? "Invoices" : "Payments"}</h2>
@@ -130,6 +229,7 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[id]"
                       {x.description}
                       {(x.payeeName || x.counterparty) && <span className="muted"> · {x.payeeName ?? x.counterparty}</span>}
                       {x.recurringPlanId && <span className="badge" style={{ marginLeft: 6 }}>recurring</span>}
+                      {x.sourcePaymentId && <span className="badge blue" style={{ marginLeft: 6 }}>share</span>}
                     </td>
                     <td className="num"><Money amount={x.amount} currency={x.currency} /></td>
                     <td><PaymentStatus status={x.status} dueDate={x.dueDate} today={t} /></td>
@@ -142,9 +242,11 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[id]"
                           ) : (
                             <ConfirmButton action={markPending.bind(null, x.id)}>Undo</ConfirmButton>
                           )}
-                          <ConfirmButton action={deletePayment.bind(null, x.id)} className="btn small danger" confirm="Delete this payment?">
-                            Delete
-                          </ConfirmButton>
+                          {x.status !== "paid" && !x.sourcePaymentId && (
+                            <ConfirmButton action={deletePayment.bind(null, x.id)} className="btn small danger" confirm="Delete this payment?">
+                              Delete
+                            </ConfirmButton>
+                          )}
                         </div>
                       </td>
                     )}

@@ -8,7 +8,9 @@ import { db } from "@/db";
 import {
   clients,
   clientUsers,
+  fundEntries,
   payments,
+  projectShares,
   projectLinks,
   projectMembers,
   projectNotes,
@@ -19,6 +21,14 @@ import {
 import { requireAdmin, requireUser } from "@/lib/dal";
 import { audit } from "@/lib/audit";
 import { canAddNotes, projectScope } from "@/lib/access";
+import {
+  deletePaymentSafely,
+  markPaymentPaid,
+  markPaymentPending,
+  MoneyFlowError,
+  validateSplit,
+  BP,
+} from "@/lib/money-flow";
 import { today } from "@/lib/dates";
 import {
   amount,
@@ -248,53 +258,172 @@ export async function savePayment(_: FormState, fd: FormData): Promise<FormState
   const me = await requireAdmin();
   const { success, data, error } = parseForm(paymentSchema, fd);
   if (!success) return { error };
-  const { id, ...v } = data;
-  const values = {
-    ...v,
-    userId: v.userId ?? null,
-    counterparty: v.counterparty ?? null,
-    method: v.method ?? null,
-    reference: v.reference ?? null,
-    paidOn: v.status === "paid" ? (v.paidOn ?? today()) : null,
-  };
+  const { id, status, paidOn, ...v } = data;
+  void id; // payments are created here, never edited (undo + re-add instead)
   try {
-    let paymentId = id;
-    if (id) {
-      await db.update(payments).set(values).where(eq(payments.id, id));
-    } else {
-      [{ id: paymentId }] = await db
-        .insert(payments)
-        .values({ ...values, createdById: me.id })
-        .returning({ id: payments.id });
+    const [created] = await db
+      .insert(payments)
+      .values({
+        ...v,
+        userId: v.direction === "outgoing" ? (v.userId ?? null) : null,
+        counterparty: v.direction === "outgoing" ? (v.counterparty ?? null) : null,
+        method: v.method ?? null,
+        reference: v.reference ?? null,
+        status: status === "cancelled" ? "cancelled" : "pending",
+        createdById: me.id,
+      })
+      .returning({ id: payments.id });
+    // "Already paid" goes through the same flow as the Mark paid button, so the
+    // split and the company fund are updated.
+    if (status === "paid") {
+      try {
+        await markPaymentPaid(db, created.id, paidOn ?? today(), me.id);
+      } catch (e) {
+        await db.delete(payments).where(eq(payments.id, created.id));
+        throw e;
+      }
     }
-    await audit(db, me.id, id ? "update" : "create", "payment", paymentId!, `${values.description} ${values.amount} ${values.currency}`);
+    await audit(db, me.id, "create", "payment", created.id, `${v.description} ${v.amount} ${v.currency}${status === "paid" ? " (paid)" : ""}`);
   } catch (e) {
+    if (e instanceof MoneyFlowError) return { error: e.message };
     return fail(e);
   }
   return done();
 }
 
-/** Bound to a form, so it takes the id only (a form appends FormData as the next argument). */
+/*
+ * Paid / unpaid / delete go through lib/money-flow.ts, which also creates or
+ * removes the members' shares and the company-fund entry. Bound to buttons, so
+ * they take the id only and return { error } instead of throwing.
+ */
+async function moneyAction(fn: () => Promise<unknown>): Promise<FormState> {
+  try {
+    await fn();
+  } catch (e) {
+    if (e instanceof MoneyFlowError) return { error: e.message };
+    throw e;
+  }
+  revalidatePath("/", "layout");
+  return undefined;
+}
+
 export async function markPaid(paymentId: string) {
   const me = await requireAdmin();
-  const paidOn = today();
-  await db.update(payments).set({ status: "paid", paidOn }).where(eq(payments.id, paymentId));
-  await audit(db, me.id, "mark-paid", "payment", paymentId, paidOn);
-  revalidatePath("/", "layout");
+  return moneyAction(async () => {
+    await markPaymentPaid(db, paymentId, today(), me.id);
+    await audit(db, me.id, "mark-paid", "payment", paymentId, today());
+  });
 }
 
 export async function markPending(paymentId: string) {
   const me = await requireAdmin();
-  await db.update(payments).set({ status: "pending", paidOn: null }).where(eq(payments.id, paymentId));
-  await audit(db, me.id, "mark-pending", "payment", paymentId);
-  revalidatePath("/", "layout");
+  return moneyAction(async () => {
+    await markPaymentPending(db, paymentId);
+    await audit(db, me.id, "mark-pending", "payment", paymentId);
+  });
 }
 
 export async function deletePayment(paymentId: string) {
   const me = await requireAdmin();
-  await db.delete(payments).where(eq(payments.id, paymentId));
-  await audit(db, me.id, "delete", "payment", paymentId);
+  return moneyAction(async () => {
+    await deletePaymentSafely(db, paymentId);
+    await audit(db, me.id, "delete", "payment", paymentId);
+  });
+}
+
+/* ------------------------------------------------------- money split */
+
+/**
+ * Sets one member's share of a project: a percentage of each client payment,
+ * or a fixed total paid out as the client pays. Applies to payments marked
+ * paid from now on.
+ */
+export async function setShare(_: FormState, fd: FormData): Promise<FormState> {
+  const me = await requireAdmin();
+  const { success, data, error } = parseForm(
+    z.object({
+      projectId: z.string(),
+      userId: z.string().min(1, "Choose a person"),
+      kind: z.enum(["percent", "fixed"]),
+      value: z.string().min(1, "Enter a value"),
+    }),
+    fd,
+  );
+  if (!success) return { error };
+  const [project] = await db.select().from(projects).where(eq(projects.id, data.projectId));
+  if (!project) return { error: "Project not found." };
+
+  let share: { userId: string; kind: "percent" | "fixed"; basisPoints: number | null; amount: number | null };
+  if (data.kind === "percent") {
+    const pct = Number(data.value.replace(",", ".").replace("%", "").trim());
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) return { error: "Percentage must be between 0 and 100." };
+    share = { userId: data.userId, kind: "percent", basisPoints: Math.round(pct * 100), amount: null };
+  } else {
+    const parsed = amount.safeParse(data.value);
+    if (!parsed.success || parsed.data <= 0) return { error: "Not a valid amount." };
+    share = { userId: data.userId, kind: "fixed", basisPoints: null, amount: parsed.data };
+  }
+
+  const others = await db.select().from(projectShares).where(eq(projectShares.projectId, data.projectId));
+  const next = [...others.filter((o) => o.userId !== share.userId), share];
+  const invalid = validateSplit(next, project.budget);
+  if (invalid) return { error: invalid };
+
+  await db
+    .insert(projectShares)
+    .values({ projectId: data.projectId, ...share })
+    .onConflictDoUpdate({
+      target: [projectShares.projectId, projectShares.userId],
+      set: { kind: share.kind, basisPoints: share.basisPoints, amount: share.amount },
+    });
+  await audit(db, me.id, "set-share", "project", data.projectId,
+    `${data.userId}: ${share.kind === "percent" ? `${share.basisPoints! / (BP / 100)}%` : `${share.amount} ${project.currency}`}`);
+  return done("Share saved. It applies to client payments marked paid from now on.");
+}
+
+export async function removeShare(projectId: string, userId: string) {
+  const me = await requireAdmin();
+  await db.delete(projectShares).where(and(eq(projectShares.projectId, projectId), eq(projectShares.userId, userId)));
+  await audit(db, me.id, "remove-share", "project", projectId, userId);
   revalidatePath("/", "layout");
+}
+
+/* ------------------------------------------------------- company fund */
+
+export async function addFundEntry(_: FormState, fd: FormData): Promise<FormState> {
+  const me = await requireAdmin();
+  const { success, data, error } = parseForm(
+    z.object({
+      direction: z.enum(["in", "out"]),
+      amount,
+      currency,
+      entryDate: date,
+      category: text(100),
+      description: text(1000),
+      projectId: optText(100),
+    }),
+    fd,
+  );
+  if (!success) return { error };
+  if (data.amount <= 0) return { error: "Amount must be more than zero." };
+  const [e] = await db
+    .insert(fundEntries)
+    .values({ ...data, projectId: data.projectId ?? null, createdById: me.id })
+    .returning({ id: fundEntries.id });
+  await audit(db, me.id, data.direction === "in" ? "fund-in" : "fund-out", "fund", e.id, `${data.description} ${data.amount} ${data.currency}`);
+  return done(data.direction === "in" ? "Added to the fund." : "Expense recorded.");
+}
+
+/** Only hand-made entries; automatic ones follow their payment (undo it instead). */
+export async function deleteFundEntry(entryId: string): Promise<FormState> {
+  const me = await requireAdmin();
+  const [e] = await db.select().from(fundEntries).where(eq(fundEntries.id, entryId));
+  if (!e) return { error: "Entry not found." };
+  if (e.paymentId) return { error: "This entry comes from a payment. Undo that payment instead." };
+  await db.delete(fundEntries).where(eq(fundEntries.id, entryId));
+  await audit(db, me.id, "fund-delete", "fund", entryId, e.description);
+  revalidatePath("/", "layout");
+  return undefined;
 }
 
 /* ------------------------------------------------------ recurring plans */

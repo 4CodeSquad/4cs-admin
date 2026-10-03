@@ -4,7 +4,9 @@ import {
   auditLog,
   clients,
   clientUsers,
+  fundEntries,
   payments,
+  projectShares,
   projectLinks,
   projectMembers,
   projectNotes,
@@ -60,6 +62,7 @@ const paymentColumns = {
   method: payments.method,
   reference: payments.reference,
   recurringPlanId: payments.recurringPlanId,
+  sourcePaymentId: payments.sourcePaymentId,
 };
 
 export async function listPayments(
@@ -178,14 +181,75 @@ export async function getProject(db: DB, v: Viewer, id: string, today: string) {
       .orderBy(asc(projectLinks.label)),
   ]);
 
+  // The split: admins see everyone's share, members only their own, clients none.
+  const shares =
+    v.role === "client"
+      ? []
+      : await db
+          .select({
+            userId: projectShares.userId,
+            name: user.name,
+            kind: projectShares.kind,
+            basisPoints: projectShares.basisPoints,
+            amount: projectShares.amount,
+          })
+          .from(projectShares)
+          .innerJoin(user, eq(user.id, projectShares.userId))
+          .where(
+            and(
+              eq(projectShares.projectId, id),
+              v.role === "member" ? eq(projectShares.userId, v.id) : undefined,
+            ),
+          )
+          .orderBy(asc(user.name));
+
   return {
     ...project,
     budget: canSeeBudget(v) ? project.budget : null,
+    shares,
+    money: v.role === "admin" ? await projectMoney(db, id) : null,
     members,
     payments: paymentRows,
     plans,
     notes,
     links,
+  };
+}
+
+/** Admin summary of where a project's money went, per currency. */
+async function projectMoney(db: DB, projectId: string) {
+  const sum = sql<number>`coalesce(sum(${payments.amount}), 0)::bigint`.mapWith(Number);
+  const [received, team, fund] = await Promise.all([
+    db
+      .select({ currency: payments.currency, total: sum })
+      .from(payments)
+      .where(and(eq(payments.projectId, projectId), eq(payments.direction, "incoming"), eq(payments.status, "paid")))
+      .groupBy(payments.currency),
+    db
+      .select({
+        currency: payments.currency,
+        paid: sql<number>`coalesce(sum(${payments.amount}) filter (where ${payments.status} = 'paid'), 0)::bigint`.mapWith(Number),
+        pending: sql<number>`coalesce(sum(${payments.amount}) filter (where ${payments.status} = 'pending'), 0)::bigint`.mapWith(Number),
+      })
+      .from(payments)
+      .where(and(eq(payments.projectId, projectId), eq(payments.direction, "outgoing"), sql`${payments.userId} is not null`))
+      .groupBy(payments.currency),
+    db
+      .select({
+        currency: fundEntries.currency,
+        in: sql<number>`coalesce(sum(${fundEntries.amount}) filter (where ${fundEntries.direction} = 'in'), 0)::bigint`.mapWith(Number),
+        out: sql<number>`coalesce(sum(${fundEntries.amount}) filter (where ${fundEntries.direction} = 'out' and ${fundEntries.category} = 'Project cost'), 0)::bigint`.mapWith(Number),
+      })
+      .from(fundEntries)
+      .where(eq(fundEntries.projectId, projectId))
+      .groupBy(fundEntries.currency),
+  ]);
+  return {
+    received,
+    teamPaid: team.map((t) => ({ currency: t.currency, total: t.paid })).filter((t) => t.total),
+    teamPending: team.map((t) => ({ currency: t.currency, total: t.pending })).filter((t) => t.total),
+    companyShare: fund.map((f) => ({ currency: f.currency, total: f.in })).filter((t) => t.total),
+    costs: fund.map((f) => ({ currency: f.currency, total: f.out })).filter((t) => t.total),
   };
 }
 
@@ -312,4 +376,44 @@ export async function listAudit(db: DB, limit = 100) {
     .leftJoin(user, eq(user.id, auditLog.actorId))
     .orderBy(desc(auditLog.createdAt))
     .limit(limit);
+}
+
+/* ----------------------------------------------------------- company fund --
+ * Admin only (callers must have passed requireAdmin()).
+ */
+
+export async function fundBalance(db: DB) {
+  return db
+    .select({
+      currency: fundEntries.currency,
+      total: sql<number>`coalesce(sum(case when ${fundEntries.direction} = 'in' then ${fundEntries.amount} else -${fundEntries.amount} end), 0)::bigint`.mapWith(Number),
+      in: sql<number>`coalesce(sum(${fundEntries.amount}) filter (where ${fundEntries.direction} = 'in'), 0)::bigint`.mapWith(Number),
+      out: sql<number>`coalesce(sum(${fundEntries.amount}) filter (where ${fundEntries.direction} = 'out'), 0)::bigint`.mapWith(Number),
+    })
+    .from(fundEntries)
+    .groupBy(fundEntries.currency)
+    .orderBy(fundEntries.currency);
+}
+
+export async function listFundEntries(db: DB, opts: { direction?: "in" | "out"; limit?: number } = {}) {
+  return db
+    .select({
+      id: fundEntries.id,
+      entryDate: fundEntries.entryDate,
+      direction: fundEntries.direction,
+      amount: fundEntries.amount,
+      currency: fundEntries.currency,
+      category: fundEntries.category,
+      description: fundEntries.description,
+      projectId: fundEntries.projectId,
+      projectName: projects.name,
+      paymentId: fundEntries.paymentId,
+      createdByName: user.name,
+    })
+    .from(fundEntries)
+    .leftJoin(projects, eq(projects.id, fundEntries.projectId))
+    .leftJoin(user, eq(user.id, fundEntries.createdById))
+    .where(opts.direction ? eq(fundEntries.direction, opts.direction) : undefined)
+    .orderBy(desc(fundEntries.entryDate), desc(fundEntries.createdAt))
+    .limit(opts.limit ?? 500);
 }
