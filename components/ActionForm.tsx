@@ -30,8 +30,8 @@ export default function ActionForm({
   return (
     <form ref={ref} action={formAction} className={className}>
       {children}
-      {state?.error && <p className="msg error" role="alert">{state.error}</p>}
-      {state?.ok && <p className="msg ok" role="status">{state.ok}</p>}
+      {state?.error && <p className="msg error prewrap" role="alert">{state.error}</p>}
+      {state?.ok && <p className="msg ok prewrap" role="status">{state.ok}</p>}
       <div>
         <button className="btn" disabled={pending}>
           {pending ? "Saving…" : submit}

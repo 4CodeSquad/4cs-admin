@@ -6,13 +6,18 @@ import * as s from "../db/schema";
 process.env.BETTER_AUTH_SECRET = "test-secret-test-secret-test-secret-123";
 process.env.BETTER_AUTH_URL = "http://localhost:3000";
 
-// Capture outgoing email instead of sending it.
+// Capture outgoing email instead of sending it; `failNext` simulates Resend refusing.
 const sent: { to: string; subject: string; text: string }[] = [];
-vi.mock("@/lib/email", () => ({
-  sendEmail: async (to: string, subject: string, text: string) => void sent.push({ to, subject, text }),
+let failNext = false;
+vi.mock("@/lib/email", async (orig) => ({
+  ...(await orig<typeof import("@/lib/email")>()),
+  sendEmail: async (to: string, subject: string, text: string) => {
+    if (failNext) { failNext = false; throw new Error("You can only send testing emails to your own email address"); }
+    sent.push({ to, subject, text });
+  },
 }));
 
-const { createAuth } = await import("@/lib/auth-config");
+const { createAuth, captureResetLink } = await import("@/lib/auth-config");
 const auth = createAuth(db);
 
 beforeAll(reset);
@@ -35,6 +40,22 @@ describe("auth", () => {
     expect(res.user.email).toBe("m@test.local");
     // The token is single-use.
     await expect(auth.api.resetPassword({ body: { token, newPassword: "another-password-2" } })).rejects.toThrow();
+  });
+
+  it("hands invite links back to the caller instead of sending them", async () => {
+    const before = sent.length;
+    const url = await captureResetLink(() =>
+      auth.api.requestPasswordReset({ body: { email: "c@test.local", redirectTo: "http://localhost:3000/reset-password?invite=1" } }),
+    );
+    expect(url).toMatch(/\/reset-password\/[A-Za-z0-9]+/);
+    expect(sent.length).toBe(before);
+  });
+
+  it("a failing self-service reset email doesn't break the request", async () => {
+    failNext = true;
+    await expect(
+      auth.api.requestPasswordReset({ body: { email: "c@test.local", redirectTo: "http://localhost:3000/reset-password" } }),
+    ).resolves.toBeTruthy();
   });
 
   it("rejects unknown roles", async () => {

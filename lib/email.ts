@@ -14,9 +14,23 @@ const FROM = process.env.EMAIL_FROM ?? "4CS Admin <onboarding@resend.dev>";
 export async function sendEmail(to: string, subject: string, text: string) {
   const key = process.env.RESEND_API_KEY;
   if (!key) {
+    // On Vercel a missing key is a configuration error, not a dev convenience.
+    if (process.env.VERCEL) throw new Error("RESEND_API_KEY is not set in Vercel's environment variables");
     console.log(`\n[email → ${to}] ${subject}\n${text}\n`);
     return;
   }
   const { error } = await new Resend(key).emails.send({ from: FROM, to, subject, text });
-  if (error) throw new Error(`Email to ${to} failed: ${error.message}`);
+  if (error) throw new Error(error.message);
 }
+
+/** The two account emails, shared by the auth config and the invite action. */
+export const accountEmail = (kind: "invite" | "reset", name: string, url: string) =>
+  kind === "invite"
+    ? {
+        subject: "Your 4CS Admin account",
+        text: `Hi ${name},\n\nAn account has been created for you on 4CS Admin.\nSet your password here (link valid for 48 hours):\n\n${url}\n`,
+      }
+    : {
+        subject: "Reset your 4CS Admin password",
+        text: `Hi ${name},\n\nUse this link to set a new password (valid for 48 hours):\n\n${url}\n\nIf you didn't ask for this, ignore this email.\n`,
+      };

@@ -66,7 +66,9 @@ export default async function TeamPage() {
                 <td className="num">
                   {u.id !== me.id && (
                     <div className="row" style={{ justifyContent: "flex-end" }}>
-                      <ConfirmButton action={resendInvite.bind(null, u.id)}>Send password link</ConfirmButton>
+                      <ActionForm action={resendInvite} submit="Send password link" className="row">
+                        <input type="hidden" name="userId" value={u.id} />
+                      </ActionForm>
                       <ConfirmButton
                         action={setBanned.bind(null, u.id, !u.banned)}
                         className={`btn small ${u.banned ? "secondary" : "danger"}`}

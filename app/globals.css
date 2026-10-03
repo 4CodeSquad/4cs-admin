@@ -106,7 +106,7 @@ textarea { min-height: 80px; resize: vertical; }
 .btn.danger { background: transparent; color: var(--red); border-color: #e3b4ae; }
 .btn.danger:hover { background: var(--red-bg); }
 .btn[disabled] { opacity: 0.6; cursor: progress; }
-.msg { padding: 8px 12px; border-radius: 6px; font-size: 13px; }
+.msg { padding: 8px 12px; border-radius: 6px; font-size: 13px; overflow-wrap: anywhere; }
 .msg.error { background: var(--red-bg); color: var(--red); }
 .msg.ok { background: var(--green-bg); color: var(--green); }
 .msg.warn { background: var(--amber-bg); color: var(--orange-text); }

@@ -7,7 +7,8 @@
 import { requireEnv } from "./env";
 import { randomBytes } from "node:crypto";
 import { createDb } from "../db/client";
-import { createAuth } from "../lib/auth-config";
+import { captureResetLink, createAuth } from "../lib/auth-config";
+import { accountEmail, sendEmail } from "../lib/email";
 
 const [email, ...nameParts] = process.argv.slice(2);
 const name = nameParts.join(" ");
@@ -24,6 +25,10 @@ const auth = createAuth(db);
 await auth.api.createUser({
   body: { email, name, role: "admin", password: randomBytes(32).toString("base64url") },
 });
-await auth.api.requestPasswordReset({ body: { email, redirectTo: `${appUrl}/reset-password?invite=1` } });
-console.log(`Admin ${email} created. Check the email (or the output above) for the set-password link.`);
+const url = await captureResetLink(() =>
+  auth.api.requestPasswordReset({ body: { email, redirectTo: `${appUrl}/reset-password?invite=1` } }),
+);
+const { subject, text } = accountEmail("invite", name, url);
+await sendEmail(email, subject, text).catch((e) => console.error(`Email not sent: ${e.message}`));
+console.log(`\nAdmin ${email} created. Set-password link (valid 48 hours, works once):\n${url}\n`);
 await sql.end();

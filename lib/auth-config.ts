@@ -5,7 +5,23 @@ import { adminAc, userAc } from "better-auth/plugins/admin/access";
 import { nextCookies } from "better-auth/next-js";
 import type { DB } from "@/db/client";
 import * as schema from "@/db/schema";
-import { sendEmail } from "./email";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { accountEmail, sendEmail } from "./email";
+
+/**
+ * Better Auth sends reset emails as a "background task" and swallows any
+ * error, so a failed invite would look like a sent one. Admin invites run
+ * inside captureResetLink(): the link is handed back to the caller, which
+ * sends the email itself and can report a failure (and show the link).
+ */
+const linkCapture = new AsyncLocalStorage<{ url?: string }>();
+
+export async function captureResetLink(request: () => Promise<unknown>): Promise<string> {
+  const box: { url?: string } = {};
+  await linkCapture.run(box, request);
+  if (!box.url) throw new Error("No password link was generated for this account");
+  return box.url;
+}
 
 export const ROLES = ["admin", "member", "client"] as const;
 export type Role = (typeof ROLES)[number];
@@ -41,13 +57,17 @@ export function createAuth(db: DB) {
       resetPasswordTokenExpiresIn: 60 * 60 * 48,
       revokeSessionsOnPasswordReset: true,
       sendResetPassword: async ({ user, url }) => {
-        const invite = decodeURIComponent(url).includes("invite=1");
-        await sendEmail(
-          user.email,
-          invite ? "Your 4CS Admin account" : "Reset your 4CS Admin password",
-          invite
-            ? `Hi ${user.name},\n\nAn account has been created for you on 4CS Admin.\nSet your password here (link valid for 48 hours):\n\n${url}\n`
-            : `Hi ${user.name},\n\nUse this link to set a new password (valid for 48 hours):\n\n${url}\n\nIf you didn't ask for this, ignore this email.\n`,
+        const capture = linkCapture.getStore();
+        if (capture) {
+          capture.url = url;
+          return;
+        }
+        // Self-service "forgot password": failures are only logged, on purpose —
+        // the page must not reveal whether an account exists.
+        const kind = decodeURIComponent(url).includes("invite=1") ? "invite" : "reset";
+        const { subject, text } = accountEmail(kind, user.name, url);
+        await sendEmail(user.email, subject, text).catch((e) =>
+          console.error(`Password email to ${user.email} failed:`, e),
         );
       },
     },
