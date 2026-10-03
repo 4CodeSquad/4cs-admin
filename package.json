@@ -2,23 +2,43 @@
   "name": "4cs-admin",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:clean": "find db -name \"._*\" -delete",
+    "db:generate": "tsx scripts/generate.ts",
+    "db:migrate": "npm run db:clean && tsx scripts/migrate.ts",
+    "create-admin": "tsx scripts/create-admin.ts",
+    "seed:demo": "tsx scripts/seed-demo.ts",
+    "vercel-build": "npm run db:migrate && next build"
   },
   "dependencies": {
+    "better-auth": "^1.7.7",
+    "drizzle-orm": "^0.45.3",
     "next": "16.3.8",
+    "postgres": "^3.4.9",
+    "qrcode": "^1.5.4",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "resend": "^6.32.0",
+    "server-only": "^0.0.1",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/node": "^20",
+    "@types/node": "^24.19.1",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "drizzle-kit": "^0.31.11",
     "eslint": "^9",
     "eslint-config-next": "16.3.8",
-    "typescript": "^5"
+    "tsx": "^4.23.15",
+    "typescript": "^5",
+    "vitest": "^5.0.3"
   }
 }

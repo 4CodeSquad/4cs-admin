@@ -1,36 +1,80 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 4CS Admin
 
-## Getting Started
+Private dashboard for 4CS projects: clients, projects, team, payments (one-off
+and recurring), notes and links, with three kinds of login:
 
-First, run the development server:
+| Role | Sees | Can change |
+|---|---|---|
+| **Admin** | everything | everything; must use two-step login |
+| **Member** (team) | projects they're assigned to; **their own** payouts; team notes | can add notes on their projects |
+| **Client** | their company's projects, invoices, and notes/links marked "client can see" | nothing |
+
+Everything runs in Node/TypeScript: Next.js 16 (App Router, server actions),
+Postgres via Drizzle ORM, Better Auth for logins, Resend for email. Hosted on
+Vercel; database on Neon. Both free tiers are enough.
+
+## How access control works
+
+All reads go through `lib/queries.ts`, and every query adds the viewer's scope
+from **`lib/access.ts`** — the one file that defines who sees what. Writes are
+server actions in `app/actions/`, each of which re-checks the session
+(`lib/dal.ts`) — `proxy.ts` only does a fast "is there a cookie" redirect.
+`tests/access.test.ts` proves the rules against a real database.
+
+## Recurring payments
+
+A recurring plan (e.g. hosting €150/month) turns into real pending payments
+14 days before each due date. `/api/cron/daily` runs every morning (see
+`vercel.json`), creates them, and emails admins a list of what's overdue or due
+this week. Dates never drift (31 Jan → 28 Feb → 31 Mar), missed days catch up,
+and running it twice can't double-bill. The app **tracks** payments; it does
+not charge cards.
+
+## Local development
+
+Needs Node 24 and a local Postgres.
 
 ```bash
+npm install
+createdb fourcs_admin && createdb fourcs_admin_test
+cp .env.example .env.local   # set DATABASE_URL to the local db, BETTER_AUTH_URL=http://localhost:3000,
+                             # and generate BETTER_AUTH_SECRET / CRON_SECRET with `openssl rand -base64 32`
+npm run db:migrate
+npm run seed:demo            # optional demo data; logins printed at the end
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm test                     # unit + database tests (uses fourcs_admin_test)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Without `RESEND_API_KEY`, emails (invites, resets, reminders) are printed in
+the dev server's console.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Schema change: edit `db/schema.ts` → `npm run db:generate -- --name what_changed`
+→ commit the new file in `db/migrations/`. Production deploys apply it.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Going live (one-time)
 
-## Learn More
+1. **Database** — create a free project at neon.tech (region: EU Frankfurt).
+   Easiest: in Vercel, Storage → Neon → connect it to this project; that sets
+   `DATABASE_URL` (pooled) and `DATABASE_URL_UNPOOLED`.
+2. **Vercel** — import this repo as a new project. Add env vars (Production):
+   `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL=https://admin.4cs.al`, `CRON_SECRET`,
+   `RESEND_API_KEY`, `EMAIL_FROM`. Don't give Preview deployments the
+   production `DATABASE_URL`.
+3. **Domain** — Vercel → Domains → add `admin.4cs.al`; add the CNAME it shows
+   at your DNS provider.
+4. **Email** — in Resend, verify the `4cs.al` domain (DNS records) and set
+   `EMAIL_FROM` to an address on it. Until then Resend only delivers to its
+   account owner.
+5. **First admin** — from your machine, with the production env vars in
+   `.env.local`: `npm run create-admin -- you@4cs.al "Your Name"`, then open the
+   emailed link, set a password, sign in, and set up two-step login.
+6. **Backups** — add the `DATABASE_URL_UNPOOLED` secret to this GitHub repo;
+   `.github/workflows/backup.yml` then keeps 30 days of nightly dumps.
 
-To learn more about Next.js, take a look at the following resources:
+## Notes
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Vercel's Hobby plan allows one cron run per day — that's what this uses.
+- This repo lives on an exFAT drive; macOS `._*` files are ignored and cleaned
+  by `npm run db:generate` (see `scripts/generate.ts`).
+- `npm audit` reports a moderate esbuild dev-server advisory via `drizzle-kit`
+  (a dev CLI). It doesn't affect the deployed app.

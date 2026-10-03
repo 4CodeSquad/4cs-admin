@@ -1,0 +1,33 @@
+# Nightly database backup. Neon's free plan only keeps a short restore window,
+# and this database holds financial records, so keep our own copies.
+#
+# Setup: repo → Settings → Secrets and variables → Actions → New secret
+#   DATABASE_URL_UNPOOLED = Neon's direct (non-pooler) connection string
+# Restore: download the artifact, then `pg_restore --clean -d "$URL" backup.dump`
+name: Database backup
+
+on:
+  schedule:
+    - cron: "30 2 * * *" # 02:30 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    container: postgres:17
+    steps:
+      - name: Dump
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_UNPOOLED }}
+        run: |
+          test -n "$DATABASE_URL" || { echo "DATABASE_URL_UNPOOLED secret is not set"; exit 1; }
+          pg_dump --format=custom --no-owner --no-acl "$DATABASE_URL" > backup.dump
+          ls -lh backup.dump
+      - uses: actions/upload-artifact@v4
+        with:
+          name: db-backup-${{ github.run_id }}
+          path: backup.dump
+          retention-days: 30
