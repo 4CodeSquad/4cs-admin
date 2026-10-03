@@ -25,21 +25,24 @@ server actions in `app/actions/`, each of which re-checks the session
 
 Each project can split its income between members (Project page → Money split):
 
-- **Percent** — the member gets that % of every client payment.
-- **Fixed** — a total for the project, paid out in proportion to the budget as
-  the client pays (€3,000 of a €12,000 budget = 25% of each payment) and
-  stopping exactly at the amount. Needs the project budget.
+- **Percent** — the member gets that % of everything the client pays.
+- **Fixed** — an amount for the project that fills up as the client pays and
+  is complete once the budget is paid. Fixed shares are measured against the
+  budget, or the money actually received if that's more (extras like hosting).
 - The **company** keeps the rest. Shares can't add up to more than 100%.
 
-When a client payment is marked paid, each member's share becomes a pending
-payout to them, and the company's part goes into the **company fund**
+The split is always computed from the project's **total received money**:
+after any change (a client payment marked paid or undone, a share changed,
+the budget edited) the project is recalculated. What each member is still
+owed becomes one pending payout; payouts already paid are never changed. The
+company's part is one "Project income" entry in the **company fund**
 (admins only, `/fund`). Paid project costs (vendors, hand-made payments to
 people) come out of the fund; members' shares don't. Admins record any other
 spending or income on the fund page with a description and category.
 
-"Undo" on a client payment removes its payouts and fund entry, and is refused
-once a member has been paid from it. The rules live in `lib/money-flow.ts`
-and are covered by `tests/money-flow.test.ts`.
+Undoing a client payment is refused if a member has already been paid more
+than their share would then be. The rules live in `lib/money-flow.ts` and are
+covered by `tests/money-flow.test.ts`.
 
 ## Recurring payments
 

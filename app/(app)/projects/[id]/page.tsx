@@ -8,7 +8,7 @@ import { CURRENCIES } from "@/lib/money";
 import ActionForm from "@/components/ActionForm";
 import ConfirmButton from "@/components/ConfirmButton";
 import { D, Direction, Money, PaymentStatus, ProjectStatus, Totals } from "@/components/ui";
-import { effectiveBasisPoints, BP } from "@/lib/money-flow";
+import { effectiveBasisPoints, splitBase, BP } from "@/lib/money-flow";
 import { formatMoney } from "@/lib/money";
 import {
   addLink,
@@ -46,7 +46,10 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[id]"
     s.kind === "percent"
       ? `${pctOf(s.basisPoints ?? 0)} of each client payment`
       : `${formatMoney(s.amount ?? 0, p.currency)} fixed for the project`;
-  const splitBp = p.shares.reduce((t, s) => t + effectiveBasisPoints(s, p.budget), 0);
+  // Fixed shares are measured against the budget, or what the client paid if more.
+  const received = p.money?.received.find((r) => r.currency === p.currency)?.total ?? 0;
+  const base = splitBase(p.budget, received);
+  const splitBp = p.shares.reduce((t, s) => t + effectiveBasisPoints(s, base), 0);
 
   return (
     <div className="stack">
@@ -131,6 +134,10 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[id]"
               )
             ) : (
               <>
+                <p className="muted" style={{ marginBottom: 8 }}>
+                  Measured against {formatMoney(base, p.currency)}
+                  {received > (p.budget ?? 0) ? " (money received, more than the budget)" : " (the budget)"}.
+                </p>
                 {p.shares.length === 0 ? (
                   <p className="empty">No split yet — everything the client pays goes to the company fund.</p>
                 ) : (
@@ -140,7 +147,7 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[id]"
                         <tr key={s.userId}>
                           <td>{s.name}</td>
                           <td>{shareLabel(s)}</td>
-                          <td className="num muted">{pctOf(effectiveBasisPoints(s, p.budget))}</td>
+                          <td className="num muted">{pctOf(effectiveBasisPoints(s, base))}</td>
                           <td className="num">
                             <ConfirmButton action={removeShare.bind(null, p.id, s.userId)} className="btn small danger" confirm={`Remove ${s.name}'s share? Payouts already created stay.`}>
                               Remove
@@ -179,8 +186,9 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[id]"
                       <label>Value<input name="value" required inputMode="decimal" placeholder="40  or  3000" /></label>
                     </div>
                     <p className="muted">
-                      Fixed amounts are paid out in proportion to the budget as the client pays, and stop at the amount.
-                      Changes apply to client payments marked paid from now on.
+                      Shares are taken from everything the client has paid on this project. A fixed amount fills up as
+                      the client pays and is complete once the budget is paid; it can be up to the budget or the money
+                      received, whichever is more. Saving recalculates the project; payouts already paid stay.
                     </p>
                   </ActionForm>
                 </details>

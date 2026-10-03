@@ -26,7 +26,8 @@ import {
   markPaymentPaid,
   markPaymentPending,
   MoneyFlowError,
-  validateSplit,
+  reconcile,
+  saveShare,
   BP,
 } from "@/lib/money-flow";
 import { today } from "@/lib/dates";
@@ -148,11 +149,14 @@ export async function saveProject(_: FormState, fd: FormData): Promise<FormState
   try {
     if (id) {
       await db.update(projects).set(values).where(eq(projects.id, id));
+      // Fixed shares are measured against the budget: recalculate.
+      await reconcile(db, id, me.id);
     } else {
       [{ id: projectId }] = await db.insert(projects).values(values).returning({ id: projects.id });
     }
     await audit(db, me.id, id ? "update" : "create", "project", projectId!, values.name);
   } catch (e) {
+    if (e instanceof MoneyFlowError) return { error: e.message };
     return fail(e);
   }
   redirect(`/projects/${projectId}`);
@@ -364,28 +368,23 @@ export async function setShare(_: FormState, fd: FormData): Promise<FormState> {
     share = { userId: data.userId, kind: "fixed", basisPoints: null, amount: parsed.data };
   }
 
-  const others = await db.select().from(projectShares).where(eq(projectShares.projectId, data.projectId));
-  const next = [...others.filter((o) => o.userId !== share.userId), share];
-  const invalid = validateSplit(next, project.budget);
-  if (invalid) return { error: invalid };
-
-  await db
-    .insert(projectShares)
-    .values({ projectId: data.projectId, ...share })
-    .onConflictDoUpdate({
-      target: [projectShares.projectId, projectShares.userId],
-      set: { kind: share.kind, basisPoints: share.basisPoints, amount: share.amount },
-    });
+  try {
+    await saveShare(db, data.projectId, share, me.id);
+  } catch (e) {
+    if (e instanceof MoneyFlowError) return { error: e.message };
+    throw e;
+  }
   await audit(db, me.id, "set-share", "project", data.projectId,
     `${data.userId}: ${share.kind === "percent" ? `${share.basisPoints! / (BP / 100)}%` : `${share.amount} ${project.currency}`}`);
-  return done("Share saved. It applies to client payments marked paid from now on.");
+  return done("Share saved. The project's payouts and company share have been recalculated.");
 }
 
 export async function removeShare(projectId: string, userId: string) {
   const me = await requireAdmin();
-  await db.delete(projectShares).where(and(eq(projectShares.projectId, projectId), eq(projectShares.userId, userId)));
-  await audit(db, me.id, "remove-share", "project", projectId, userId);
-  revalidatePath("/", "layout");
+  return moneyAction(async () => {
+    await saveShare(db, projectId, { userId, remove: true }, me.id);
+    await audit(db, me.id, "remove-share", "project", projectId, userId);
+  });
 }
 
 /* ------------------------------------------------------- company fund */

@@ -4,143 +4,166 @@ import { db, reset } from "./db";
 import { seed } from "./fixtures";
 import * as s from "../db/schema";
 import {
-  computeSplit,
   deletePaymentSafely,
+  entitlements,
   markPaymentPaid,
   markPaymentPending,
   MoneyFlowError,
+  reconcile,
+  saveShare,
   validateSplit,
 } from "@/lib/money-flow";
 
 const fixed = (userId: string, amount: number) => ({ userId, kind: "fixed" as const, basisPoints: null, amount });
 const pct = (userId: string, basisPoints: number) => ({ userId, kind: "percent" as const, basisPoints, amount: null });
 
-describe("computeSplit", () => {
-  it("percent shares round down; the company gets the remainder", () => {
-    const r = computeSplit({ amount: 1001, budget: null, paidBefore: 0, shares: [{ ...pct("a", 3333), allocatedBefore: 0 }] });
-    expect(r.members[0].amount).toBe(333);
-    expect(r.company).toBe(668);
+describe("entitlements and validation", () => {
+  it("fixed shares fill up as the client pays and complete at the budget", () => {
+    expect(entitlements([fixed("a", 30000)], 120000, 48000)).toEqual([{ userId: "a", amount: 12000 }]);
+    expect(entitlements([fixed("a", 30000)], 120000, 120000)[0].amount).toBe(30000);
   });
-  it("fixed shares reach exactly their amount when the budget is paid, despite rounding", () => {
-    let allocated = 0, paid = 0;
-    for (const amount of [33333, 33333, 33334]) {
-      const r = computeSplit({ amount, budget: 100000, paidBefore: paid, shares: [{ ...fixed("a", 33333), allocatedBefore: allocated }] });
-      allocated += r.members[0].amount; paid += amount;
-      expect(r.members[0].amount + r.company).toBe(amount);
-    }
-    expect(allocated).toBe(33333);
+  it("money received beyond the budget counts (extras like hosting)", () => {
+    // budget 400, client paid 500 → 3 × 150 = 450 is 90%, allowed
+    expect(validateSplit([fixed("a", 15000), fixed("b", 15000), fixed("c", 15000)], 40000, 50000)).toBeNull();
+    expect(entitlements([fixed("a", 15000), fixed("b", 15000), fixed("c", 15000)], 40000, 50000).map((e) => e.amount))
+      .toEqual([15000, 15000, 15000]);
   });
-  it("fixed shares stop at their amount when the client pays more than the budget", () => {
-    const r = computeSplit({ amount: 50000, budget: 100000, paidBefore: 100000, shares: [{ ...fixed("a", 30000), allocatedBefore: 30000 }] });
-    expect(r.members[0].amount).toBe(0);
-    expect(r.company).toBe(50000);
+  it("refuses more than 100% of max(budget, received), with a clear reason", () => {
+    expect(validateSplit([fixed("a", 15000), fixed("b", 15000), fixed("c", 15000)], 40000, 40000)).toMatch(/only 400/);
+    expect(validateSplit([pct("a", 6000), pct("b", 5000)], null, 0)).toMatch(/more than 100%/);
   });
-});
-
-describe("validateSplit", () => {
-  it("rejects more than 100%", () => {
-    expect(validateSplit([pct("a", 6000), fixed("b", 5000)], 10000)).toMatch(/more than 100%/);
-    expect(validateSplit([pct("a", 6000), fixed("b", 4000)], 10000)).toBeNull();
-  });
-  it("needs a budget for fixed shares", () => {
-    expect(validateSplit([fixed("a", 100)], null)).toMatch(/budget/);
+  it("never gives the team more than came in", () => {
+    const e = entitlements([fixed("a", 30000), fixed("b", 30000)], 40000, 40000); // budget lowered below the split
+    expect(e.reduce((t, x) => t + x.amount, 0)).toBeLessThanOrEqual(40000);
   });
 });
 
-describe("payment flows (database)", () => {
-  // P1 budget €12,000. memberA: fixed €3,000 (25%). memberB: 20%. Company: the rest.
+describe("project money (database)", () => {
   beforeEach(async () => {
     await reset();
     await seed();
-    await db.update(s.projects).set({ budget: 1200000 }).where(eq(s.projects.id, "P1"));
-    await db.insert(s.projectShares).values([
-      { projectId: "P1", userId: "memberA", kind: "fixed", amount: 300000 },
-      { projectId: "P1", userId: "memberB", kind: "percent", basisPoints: 2000 },
+  });
+  const pay = async (id: string, amount: number, opts: Partial<typeof s.payments.$inferInsert> = {}) =>
+    db.insert(s.payments).values({ id, projectId: "P1", direction: "incoming", description: id, amount, currency: "EUR", dueDate: "2026-10-01", ...opts });
+  const payouts = async () =>
+    (await db.select({ userId: s.payments.userId, amount: s.payments.amount, status: s.payments.status })
+      .from(s.payments).where(and(eq(s.payments.projectId, "P1"), isNotNull(s.payments.sourcePaymentId)))
+      .orderBy(s.payments.userId, s.payments.status));
+  const company = async () =>
+    (await db.select().from(s.fundEntries).where(and(eq(s.fundEntries.projectId, "P1"), eq(s.fundEntries.category, "Project income"))))
+      .reduce((t, e) => t + e.amount, 0);
+
+  it("REGRESSION (PPG.AL): split set after the money came in, 3 × €150 of €500 → company €50", async () => {
+    await db.update(s.projects).set({ budget: 40000 }).where(eq(s.projects.id, "P1"));
+    await pay("full", 40000);
+    await markPaymentPaid(db, "full", "2026-10-03", "admin"); // paid before any split
+    expect(await company()).toBe(40000);
+
+    await saveShare(db, "P1", fixed("memberA", 15000), "admin");
+    await saveShare(db, "P1", fixed("memberB", 15000), "admin");
+    expect(await payouts()).toEqual([
+      { userId: "memberA", amount: 15000, status: "pending" },
+      { userId: "memberB", amount: 15000, status: "pending" },
     ]);
-  });
-  const inc = async (id: string, amount: number, currency: "EUR" | "ALL" = "EUR") =>
-    db.insert(s.payments).values({ id, projectId: "P1", direction: "incoming", description: id, amount, currency, dueDate: "2026-02-01" });
-  const payouts = (src: string) =>
-    db.select({ userId: s.payments.userId, amount: s.payments.amount, status: s.payments.status })
-      .from(s.payments).where(eq(s.payments.sourcePaymentId, src)).orderBy(s.payments.userId);
-  const fund = () => db.select().from(s.fundEntries).orderBy(s.fundEntries.createdAt);
+    expect(await company()).toBe(10000);
 
-  it("splits a client payment into member payouts and the company fund", async () => {
-    await inc("pay1", 480000);
-    await markPaymentPaid(db, "pay1", "2026-02-02", "admin");
-    expect(await payouts("pay1")).toEqual([
-      { userId: "memberA", amount: 120000, status: "pending" }, // 25% of 4,800
-      { userId: "memberB", amount: 96000, status: "pending" },  // 20%
+    // Both paid, then the €100 hosting payment comes in
+    for (const p of await db.select().from(s.payments).where(isNotNull(s.payments.sourcePaymentId))) {
+      await markPaymentPaid(db, p.id, "2026-10-03", "admin");
+    }
+    await pay("hosting", 10000);
+    await markPaymentPaid(db, "hosting", "2026-10-03", "admin");
+    expect((await payouts()).every((p) => p.status === "paid")).toBe(true); // no new payouts out of thin air
+    expect(await company()).toBe(20000);
+
+    // Third person, €150: allowed because €500 was received (budget was only €400)
+    await saveShare(db, "P1", fixed("admin", 15000), "admin");
+    expect((await payouts()).filter((p) => p.status === "pending")).toEqual([{ userId: "admin", amount: 15000, status: "pending" }]);
+    expect(await company()).toBe(5000);
+  });
+
+  it("percent shares grow with each payment; the pending payout is always 'owed minus paid'", async () => {
+    await saveShare(db, "P1", pct("memberA", 2000), "admin");
+    await pay("p1", 100000); await markPaymentPaid(db, "p1", "2026-10-01", null);
+    let [a] = await payouts();
+    expect(a).toEqual({ userId: "memberA", amount: 20000, status: "pending" });
+    await markPaymentPaid(db, (await db.select().from(s.payments).where(isNotNull(s.payments.sourcePaymentId)))[0].id, "2026-10-02", null);
+    await pay("p2", 50000); await markPaymentPaid(db, "p2", "2026-10-05", null);
+    expect(await payouts()).toEqual([
+      { userId: "memberA", amount: 10000, status: "pending" },
+      { userId: "memberA", amount: 20000, status: "paid" },
     ]);
-    const [f] = await fund();
-    expect(f).toMatchObject({ direction: "in", amount: 264000, category: "Project income", paymentId: "pay1" });
+    expect(await company()).toBe(120000);
   });
 
-  it("completes the fixed share exactly over several payments, then stops", async () => {
-    await inc("pay1", 480000); await markPaymentPaid(db, "pay1", "2026-02-02", null);
-    await inc("pay2", 720000); await markPaymentPaid(db, "pay2", "2026-03-02", null);
-    await inc("pay3", 100000); await markPaymentPaid(db, "pay3", "2026-04-02", null); // beyond the budget
-    const a = await db.select({ amount: s.payments.amount }).from(s.payments)
-      .where(and(eq(s.payments.userId, "memberA"), isNotNull(s.payments.sourcePaymentId)));
-    expect(a.reduce((t, r) => t + r.amount, 0)).toBe(300000);
-    expect((await payouts("pay3")).map((p) => [p.userId, p.amount])).toEqual([["memberB", 20000]]);
+  it("is idempotent and order-independent", async () => {
+    await db.update(s.projects).set({ budget: 100000 }).where(eq(s.projects.id, "P1"));
+    await pay("p1", 60000); await pay("p2", 40000);
+    await markPaymentPaid(db, "p2", "2026-10-02", null);
+    await saveShare(db, "P1", fixed("memberA", 30000), "admin");
+    await markPaymentPaid(db, "p1", "2026-10-01", null);
+    await reconcile(db, "P1", null);
+    await reconcile(db, "P1", null);
+    expect(await payouts()).toEqual([{ userId: "memberA", amount: 30000, status: "pending" }]);
+    expect(await company()).toBe(70000);
   });
 
-  it("is idempotent", async () => {
-    await inc("pay1", 480000);
-    await markPaymentPaid(db, "pay1", "2026-02-02", null);
-    await markPaymentPaid(db, "pay1", "2026-02-02", null);
-    expect(await payouts("pay1")).toHaveLength(2);
-    expect(await fund()).toHaveLength(1);
+  it("undo is refused if a member was already paid more than they'd be owed", async () => {
+    await saveShare(db, "P1", fixed("memberA", 30000), "admin");
+    await db.update(s.projects).set({ budget: 100000 }).where(eq(s.projects.id, "P1"));
+    await pay("p1", 100000); await markPaymentPaid(db, "p1", "2026-10-01", null);
+    const [share] = await db.select().from(s.payments).where(isNotNull(s.payments.sourcePaymentId));
+    await markPaymentPaid(db, share.id, "2026-10-02", null);
+    await expect(markPaymentPending(db, "p1")).rejects.toThrow(/already been paid/);
+    const [p] = await db.select().from(s.payments).where(eq(s.payments.id, "p1"));
+    expect(p.status).toBe("paid"); // rolled back
   });
 
-  it("undo removes the payouts and the fund entry", async () => {
-    await inc("pay1", 480000);
-    await markPaymentPaid(db, "pay1", "2026-02-02", null);
-    await markPaymentPending(db, "pay1");
-    expect(await payouts("pay1")).toEqual([]);
-    expect(await fund()).toEqual([]);
-    const [p] = await db.select().from(s.payments).where(eq(s.payments.id, "pay1"));
-    expect(p).toMatchObject({ status: "pending", paidOn: null });
+  it("undo without paid payouts recalculates everything", async () => {
+    await saveShare(db, "P1", pct("memberA", 5000), "admin");
+    await pay("p1", 100000); await markPaymentPaid(db, "p1", "2026-10-01", null);
+    await markPaymentPending(db, "p1");
+    expect(await payouts()).toEqual([]);
+    expect(await company()).toBe(0);
   });
 
-  it("undo is refused once a member has been paid their share", async () => {
-    await inc("pay1", 480000);
-    await markPaymentPaid(db, "pay1", "2026-02-02", null);
-    await db.update(s.payments).set({ status: "paid" }).where(and(eq(s.payments.sourcePaymentId, "pay1"), eq(s.payments.userId, "memberA")));
-    await expect(markPaymentPending(db, "pay1")).rejects.toBeInstanceOf(MoneyFlowError);
+  it("shares can't exceed 100% of what the project brings in", async () => {
+    await db.update(s.projects).set({ budget: 40000 }).where(eq(s.projects.id, "P1"));
+    await saveShare(db, "P1", fixed("memberA", 15000), "admin");
+    await saveShare(db, "P1", fixed("memberB", 15000), "admin");
+    await expect(saveShare(db, "P1", fixed("admin", 15000), "admin")).rejects.toBeInstanceOf(MoneyFlowError);
   });
 
-  it("paying a member's share doesn't touch the fund; paying a cost takes it out of the fund", async () => {
-    await inc("pay1", 480000);
-    await markPaymentPaid(db, "pay1", "2026-02-02", null);
-    const [share] = await db.select().from(s.payments).where(eq(s.payments.sourcePaymentId, "pay1")).limit(1);
-    await markPaymentPaid(db, share.id, "2026-02-03", null);
-    expect(await fund()).toHaveLength(1);
-    await markPaymentPaid(db, "out-vendor-P1", "2026-02-04", null); // €100 vendor cost from the fixture
-    const entries = await fund();
-    expect(entries[1]).toMatchObject({ direction: "out", amount: 10000, category: "Project cost" });
+  it("removing a share returns its unpaid part to the company", async () => {
+    await saveShare(db, "P1", pct("memberA", 5000), "admin");
+    await pay("p1", 100000); await markPaymentPaid(db, "p1", "2026-10-01", null);
+    expect(await company()).toBe(50000);
+    await saveShare(db, "P1", { userId: "memberA", remove: true }, "admin");
+    expect(await payouts()).toEqual([]);
+    expect(await company()).toBe(100000);
+  });
+
+  it("project costs come out of the fund; members' shares don't", async () => {
+    await saveShare(db, "P1", pct("memberA", 5000), "admin");
+    await pay("p1", 100000); await markPaymentPaid(db, "p1", "2026-10-01", null);
+    const [share] = await db.select().from(s.payments).where(isNotNull(s.payments.sourcePaymentId));
+    await markPaymentPaid(db, share.id, "2026-10-02", null);
+    await markPaymentPaid(db, "out-vendor-P1", "2026-10-02", null);
+    const out = await db.select().from(s.fundEntries).where(eq(s.fundEntries.direction, "out"));
+    expect(out).toEqual([expect.objectContaining({ amount: 10000, category: "Project cost" })]);
   });
 
   it("refuses a client payment in another currency on a split project", async () => {
-    await inc("payALL", 100000, "ALL");
-    await expect(markPaymentPaid(db, "payALL", "2026-02-02", null)).rejects.toThrow(/split in EUR/);
-    const [p] = await db.select().from(s.payments).where(eq(s.payments.id, "payALL"));
-    expect(p.status).toBe("pending"); // the whole transaction rolled back
-  });
-
-  it("projects without a split put the whole payment in the fund", async () => {
-    await markPaymentPaid(db, "in-P2", "2026-02-02", null);
-    expect((await fund())[0]).toMatchObject({ direction: "in", amount: 10000 });
+    await saveShare(db, "P1", pct("memberA", 5000), "admin");
+    await pay("all", 100000, { currency: "ALL" });
+    await expect(markPaymentPaid(db, "all", "2026-10-01", null)).rejects.toThrow(/split in EUR/);
   });
 
   it("guards deletes", async () => {
-    await inc("pay1", 480000);
-    await markPaymentPaid(db, "pay1", "2026-02-02", null);
-    await expect(deletePaymentSafely(db, "pay1")).rejects.toThrow(/unpaid first/);
-    const [share] = await payouts("pay1");
-    const [row] = await db.select().from(s.payments).where(and(eq(s.payments.sourcePaymentId, "pay1"), eq(s.payments.userId, share.userId!)));
-    await expect(deletePaymentSafely(db, row.id)).rejects.toThrow(/Undo that client payment/);
-    await deletePaymentSafely(db, "in-P2");
+    await saveShare(db, "P1", pct("memberA", 5000), "admin");
+    await pay("p1", 100000); await markPaymentPaid(db, "p1", "2026-10-01", null);
+    await expect(deletePaymentSafely(db, "p1")).rejects.toThrow(/unpaid first/);
+    const [share] = await db.select().from(s.payments).where(isNotNull(s.payments.sourcePaymentId));
+    await expect(deletePaymentSafely(db, share.id)).rejects.toThrow(/member's share/);
   });
 });
